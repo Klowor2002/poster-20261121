@@ -1,257 +1,292 @@
 #!/usr/bin/env python3
-"""LUMINARA — a travel poster for a place that isn't there.
+"""Luminara — the harbour where the aurora touches the sea.
 
-A harbour town where the aurora touches the sea. Drawn entirely with
-PIL shapes and gradients: no external images, no network, fully
-deterministic (fixed seed, no timestamps, no unseeded randomness).
-
-Writes one image to $MAKEFUN_OUTPUT_DIR/entry.png (default /output).
-Canvas 768 x 1024 portrait, PNG, under 1 MiB.
+A travel poster for an invented place, drawn entirely with the Python 3.13
+standard library (no third-party packages: hand-rolled PNG encoder, in-code
+bitmap lettering). Writes one deterministic image to /output/entry.png.
 """
-
-import os
+import binascii
+import hashlib
 import math
-import random
-
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import os
+import struct
+import sys
+import time
+import zlib
 
 W, H = 768, 1024
-SEED = 20261121
+HORIZON = 620
+OUT = "/output/entry.png"
 
-CREAM = (250, 238, 210)
-TEAL_DEEP = (4, 38, 48)
-INDIGO = (24, 32, 78)
-HORIZON = (46, 96, 110)
+# ---------------------------------------------------------------- framebuffer
+buf = bytearray(W * H * 3)
+
+
+def idx(x, y):
+    return (y * W + x) * 3
+
+
+def set_px(x, y, r, g, b):
+    if 0 <= x < W and 0 <= y < H:
+        i = idx(x, y)
+        buf[i] = r
+        buf[i + 1] = g
+        buf[i + 2] = b
+
+
+def blend_px(x, y, r, g, b, a):
+    """Alpha-blend a colour over the pixel at (x, y). a in [0, 1]."""
+    if 0 <= x < W and 0 <= y < H and a > 0.0:
+        if a >= 1.0:
+            set_px(x, y, r, g, b)
+            return
+        i = idx(x, y)
+        buf[i] = int(r * a + buf[i] * (1.0 - a))
+        buf[i + 1] = int(g * a + buf[i + 1] * (1.0 - a))
+        buf[i + 2] = int(b * a + buf[i + 2] * (1.0 - a))
+
+
+def fill_row(y, r, g, b):
+    buf[y * W * 3:(y + 1) * W * 3] = bytes((r, g, b)) * W
 
 
 def lerp(a, b, t):
-    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+    return int(a + (b - a) * t)
 
 
-def vertical_gradient(size, stops):
-    """stops: list of (y_fraction, color)."""
-    w, h = size
-    img = Image.new("RGB", (w, h))
-    px = img.load()
-    for y in range(h):
-        f = y / max(1, h - 1)
-        for i in range(len(stops) - 1):
-            f0, c0 = stops[i]
-            f1, c1 = stops[i + 1]
-            if f0 <= f <= f1:
-                t = 0.0 if f1 == f0 else (f - f0) / (f1 - f0)
-                col = lerp(c0, c1, t)
-                break
-        else:
-            col = stops[-1][1]
-        for x in range(w):
-            px[x, y] = col
-    return img
+def lerp3(c1, c2, t):
+    return (lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t))
 
 
-def draw_title(draw, font, text, cx, y, spacing):
-    """Letterspaced caps, centred on cx, drawn char by char."""
-    widths = [draw.textlength(ch, font=font) for ch in text]
-    total = sum(widths) + spacing * (len(text) - 1)
-    x = cx - total / 2
-    for ch, wd in zip(text, widths):
-        draw.text((x, y), ch, font=font, fill=CREAM)
-        x += wd + spacing
-    return total
+# ------------------------------------------------------------------- randomness
+_seed = [123456789]
+
+
+def rnd():
+    """Deterministic LCG, uniform in [0, 1). Same output on every run."""
+    _seed[0] = (_seed[0] * 1103515245 + 12345) & 0x7FFFFFFF
+    return _seed[0] / 0x7FFFFFFF
+
+
+# ------------------------------------------------------------------------- sky
+SKY_TOP = (7, 38, 54)
+SKY_MID = (10, 30, 62)
+SKY_HOR = (18, 24, 64)
+
+for y in range(HORIZON):
+    t = y / (HORIZON - 1)
+    if t < 0.55:
+        c = lerp3(SKY_TOP, SKY_MID, t / 0.55)
+    else:
+        c = lerp3(SKY_MID, SKY_HOR, (t - 0.55) / 0.45)
+    fill_row(y, *c)
+
+# Stars: scattered pinpricks, denser and brighter high in the sky.
+for _ in range(260):
+    sx = int(rnd() * W)
+    sy = int(rnd() * 540)
+    bright = 120 + int(rnd() * 135)
+    dim = 0.45 + 0.55 * (1.0 - sy / 560.0)
+    v = int(bright * dim)
+    set_px(sx, sy, v, v, min(255, v + 18))
+    if rnd() < 0.10:  # a few brighter stars get a tiny cross sparkle
+        set_px(sx + 1, sy, v, v, min(255, v + 18))
+        set_px(sx, sy + 1, v, v, min(255, v + 18))
+
+# Pale moon, upper left, clear of the title lettering, with a soft halo.
+MOON = (88, 108)
+for dy in range(-70, 71):
+    for dx in range(-70, 71):
+        d = math.sqrt(dx * dx + dy * dy)
+        if d <= 24:
+            set_px(MOON[0] + dx, MOON[1] + dy, 232, 238, 244)
+        elif d <= 70:
+            a = 0.10 * (1.0 - (d - 24) / 46.0)
+            blend_px(MOON[0] + dx, MOON[1] + dy, 200, 215, 235, a)
+
+# ---------------------------------------------------------------------- aurora
+# Three translucent ribbons, each a wavy band across the sky.
+RIBBONS = [
+    # base_y, amp, period, phase, width, strength, colour
+    (150, 46, 520, 0, 16, 0.50, (64, 232, 168)),
+    (250, 60, 640, 130, 22, 0.42, (46, 214, 196)),
+    (330, 38, 430, 260, 13, 0.38, (140, 240, 190)),
+]
+for base, amp, period, phase, width, strength, col in RIBBONS:
+    for x in range(W):
+        centre = (base + amp * math.sin(2 * math.pi * (x + phase) / period)
+                  + 9 * math.sin(2 * math.pi * (x * 3 + phase) / (period * 2.7)))
+        lo = max(0, int(centre - 3 * width))
+        hi = min(HORIZON - 1, int(centre + 3 * width))
+        for y in range(lo, hi + 1):
+            d = (y - centre) / width
+            a = strength * math.exp(-d * d)
+            if a > 0.01:
+                blend_px(x, y, col[0], col[1], col[2], a)
+
+# ------------------------------------------------------- distant headland (left)
+for x in range(0, 320):
+    top = HORIZON - 30 - int(14 * math.sin(x * 0.021 + 0.6)) - int(6 * math.sin(x * 0.057))
+    for y in range(top, HORIZON):
+        set_px(x, y, 9, 15, 32)
+
+# ------------------------------------------------------------------------- sea
+SEA_TOP = (13, 30, 52)
+SEA_BOT = (5, 14, 30)
+for y in range(HORIZON, H):
+    t = (y - HORIZON) / (H - 1 - HORIZON)
+    c = lerp3(SEA_TOP, SEA_BOT, t)
+    fill_row(y, *c)
+    # Faint green aurora glow reflected just below the horizon.
+    if y < HORIZON + 170:
+        glow = int(20 * math.exp(-(y - HORIZON) / 110.0))
+        i = y * W * 3
+        for x in range(W):
+            buf[i + 1] = min(255, buf[i + 1] + glow)
+            i += 3
+
+# Horizontal shimmer streaks on the water.
+for _ in range(90):
+    sx = int(rnd() * (W - 140))
+    sy = HORIZON + 8 + int(rnd() * (H - HORIZON - 16))
+    ln = 20 + int(rnd() * 100)
+    a = 0.08 + rnd() * 0.14
+    for x in range(sx, min(W, sx + ln)):
+        blend_px(x, sy, 150, 200, 220, a)
+
+# ------------------------------------------------------------ lighthouse + islet
+# Rocky islet: a low dark ellipse at the waterline.
+ISLET_CX, ISLET_CY, ISLET_RX, ISLET_RY = 562, 620, 64, 24
+for y in range(ISLET_CY - ISLET_RY, ISLET_CY + ISLET_RY + 1):
+    dy = (y - ISLET_CY) / ISLET_RY
+    hw = int(ISLET_RX * math.sqrt(max(0.0, 1.0 - dy * dy)))
+    for x in range(ISLET_CX - hw, ISLET_CX + hw + 1):
+        shade = 16 + int(6 * (1.0 - abs(dy)))
+        set_px(x, y, shade, shade + 5, shade + 14)
+# Pale highlight following the islet's curved top edge.
+for x in range(ISLET_CX - 52, ISLET_CX + 53):
+    dx = (x - ISLET_CX) / ISLET_RX
+    top_y = ISLET_CY - int(ISLET_RY * math.sqrt(max(0.0, 1.0 - dx * dx)))
+    blend_px(x, top_y, 90, 110, 130, 0.5)
+    blend_px(x, top_y + 1, 90, 110, 130, 0.3)
+
+# Tower: a tapered pale column, darker on its right side.
+for y in range(524, 613):
+    t = (y - 524) / (613 - 524)  # 0 at top, 1 at base
+    half = int(10 + 6 * t)
+    for x in range(562 - half, 562 + half + 1):
+        shade = 214 - int(46 * max(0.0, (x - 562) / max(1, half)))
+        set_px(x, y, shade, min(255, shade + 14), min(255, shade + 22))
+# Gallery band and lamp room.
+for y in range(520, 528):
+    for x in range(548, 577):
+        set_px(x, y, 30, 34, 44)
+for y in range(506, 520):
+    for x in range(552, 573):
+        set_px(x, y, 255, 196, 110)
+for y in range(510, 517):
+    for x in range(556, 569):
+        set_px(x, y, 255, 232, 170)
+# Little domed roof.
+for y in range(500, 506):
+    half = int(3 + (506 - y) * 1.6)
+    for x in range(562 - half, 562 + half + 1):
+        set_px(x, y, 40, 46, 60)
+
+# Two soft light beams sweeping down from the lamp, left and right.
+for sign in (-1, 1):
+    for step in range(0, 260, 2):
+        bx = 562 + sign * int(step * 0.92)
+        by = 514 + int(step * 0.30)
+        hw = 4 + int(step * 0.12)
+        a = 0.16 * math.exp(-step / 160.0)
+        for x in range(bx - hw, bx + hw + 1):
+            blend_px(x, by, 255, 220, 150, a)
+            blend_px(x, by + 1, 255, 220, 150, a * 0.7)
+
+# Golden light path on the water, straight below the lamp.
+for y in range(HORIZON + 4, H):
+    depth = (y - HORIZON) / (H - HORIZON)
+    half = int(14 + 34 * depth)
+    wob = int(8 * math.sin(y * 0.05) + 5 * math.sin(y * 0.13))
+    a0 = 0.42 * math.exp(-(y - HORIZON) / 260.0) * (0.7 + 0.3 * math.sin(y * 0.11))
+    for x in range(562 + wob - half, 562 + wob + half + 1):
+        fall = 1.0 - abs(x - (562 + wob)) / max(1, half)
+        blend_px(x, y, 255, 214, 140, a0 * fall)
+
+# -------------------------------------------------------------- the name LUMINARA
+# 5x7 hand-drawn bitmap letterforms, scaled up, warm cream, letterspaced.
+GLYPHS = {
+    "L": ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+    "U": ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+    "M": ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+    "I": ["01110", "00100", "00100", "00100", "00100", "00100", "01110"],
+    "N": ["10001", "11001", "10101", "10011", "10001", "10001", "10001"],
+    "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+    "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
+}
+WORD = "LUMINARA"
+SCALE = 9
+SPACING = 14
+GW, GH = 5 * SCALE, 7 * SCALE
+total_w = len(WORD) * GW + (len(WORD) - 1) * SPACING
+X0 = (W - total_w) // 2
+Y0 = 64
+
+
+def draw_word(ox, oy, colour):
+    for li, ch in enumerate(WORD):
+        gx = X0 + li * (GW + SPACING)
+        rows = GLYPHS[ch]
+        for r in range(7):
+            for c in range(5):
+                if rows[r][c] == "1":
+                    for dy in range(SCALE):
+                        for dx in range(SCALE):
+                            set_px(gx + ox + c * SCALE + dx,
+                                   Y0 + oy + r * SCALE + dy,
+                                   *colour)
+
+
+draw_word(3, 4, (8, 14, 30))        # soft dark offset, for legibility
+draw_word(0, 0, (245, 230, 196))   # warm cream caps
+
+# ---------------------------------------------------------------- PNG encoding
+def chunk(ctype, data):
+    out = struct.pack(">I", len(data)) + ctype + data
+    out += struct.pack(">I", binascii.crc32(ctype + data) & 0xFFFFFFFF)
+    return out
+
+
+def encode_png():
+    raw = bytearray()
+    for y in range(H):
+        row = bytes(buf[y * W * 3:(y + 1) * W * 3])
+        # Try filter 0 (None) and filter 1 (Sub); keep the smaller residual.
+        f0 = b"\x00" + row
+        sub = bytearray(b"\x01")
+        prev = 0
+        for v in row:
+            sub.append((v - prev) & 0xFF)
+            prev = v
+        score0 = sum(abs(b if b < 128 else b - 256) for b in row)
+        score1 = sum(abs(b if b < 128 else b - 256) for b in sub[1:])
+        raw += f0 if score0 <= score1 else bytes(sub)
+    ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
 
 
 def main():
-    rng = random.Random(SEED)
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(out_dir, exist_ok=True)
-
-    # ---- sky: deep teal at top -> indigo -> soft teal glow at horizon ----
-    horizon_y = 640
-    img = vertical_gradient(
-        (W, H),
-        [(0.0, TEAL_DEEP), (0.42, INDIGO), (0.62, (34, 74, 96)),
-         (0.66, HORIZON), (1.0, (8, 44, 58))],
-    )
-    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
-
-    # ---- stars (upper sky only) ----
-    for _ in range(240):
-        x = rng.uniform(0, W)
-        y = rng.uniform(0, horizon_y - 90)
-        r = rng.choice([0.7, 0.9, 1.1, 1.4])
-        a = rng.randint(90, 235)
-        od.ellipse([x - r, y - r, x + r, y + r], fill=(255, 250, 230, a))
-    # a few bright stars with a cross sparkle
-    for _ in range(14):
-        x = rng.uniform(20, W - 20)
-        y = rng.uniform(20, horizon_y - 160)
-        L = rng.uniform(4, 9)
-        od.line([x - L, y, x + L, y], fill=(255, 250, 230, 200), width=1)
-        od.line([x, y - L, x, y + L], fill=(255, 250, 230, 200), width=1)
-
-    # ---- aurora ribbons: layered translucent sine bands ----
-    ribbons = [
-        # (base_y, amplitude, wavelength, thickness, color, alpha)
-        (150, 46, 420, 34, (64, 224, 178), 26),
-        (210, 60, 360, 44, (84, 214, 190), 22),
-        (270, 52, 300, 36, (150, 120, 235), 20),
-        (330, 40, 480, 28, (58, 226, 196), 18),
-    ]
-    for base_y, amp, wl, thick, color, alpha in ribbons:
-        pts_top, pts_bot = [], []
-        for x in range(0, W + 8, 8):
-            yc = base_y + amp * math.sin(2 * math.pi * x / wl + base_y)
-            yc += 14 * math.sin(2 * math.pi * x / (wl * 0.37) + 1.3)
-            pts_top.append((x, yc - thick / 2))
-            pts_bot.append((x, yc + thick / 2))
-        od.polygon(pts_top + pts_bot[::-1], fill=color + (alpha,))
-
-    img = Image.alpha_composite(img.convert("RGBA"), overlay)
-
-    # ---- sea: calm water from the horizon down ----
-    sea = Image.new("RGBA", (W, H - horizon_y), (0, 0, 0, 0))
-    sd = ImageDraw.Draw(sea)
-    for y in range(H - horizon_y):
-        t = y / max(1, H - horizon_y - 1)
-        col = lerp((52, 108, 122), (6, 30, 44), t)
-        sd.line([(0, y), (W, y)], fill=col + (255,))
-    # gentle horizontal swell lines
-    for _ in range(46):
-        y = rng.uniform(8, H - horizon_y - 8)
-        x0 = rng.uniform(0, W - 180)
-        ln = rng.uniform(50, 200)
-        a = rng.randint(18, 60)
-        sd.line([(x0, y), (x0 + ln, y)], fill=(170, 225, 215, a), width=2)
-    img.paste(Image.alpha_composite(img.crop((0, horizon_y, W, H)),
-                                    sea).convert("RGB"), (0, horizon_y))
-    img = img.convert("RGBA")
-    draw = ImageDraw.Draw(img)
-
-    # ---- light path: the lighthouse beam reflected on the water ----
-    # soft, jittered dashes that widen and fade toward the viewer
-    lx = 384  # lighthouse centre x
-    path = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    pd = ImageDraw.Draw(path)
-    for i in range(30):
-        y = horizon_y + 12 + i * 12
-        half = 10 + i * 4.2 + rng.uniform(-4, 4)
-        a = max(0, 155 - i * 5)
-        pd.line([(lx - half, y), (lx + half, y)],
-                fill=(250, 232, 190, a), width=4)
-    path = path.filter(ImageFilter.GaussianBlur(2))
-    img = Image.alpha_composite(img, path)
-    draw = ImageDraw.Draw(img)
-
-    # ---- rocky islet ----
-    rock = [(lx - 118, horizon_y + 4), (lx - 88, horizon_y - 34),
-            (lx - 40, horizon_y - 52), (lx + 8, horizon_y - 44),
-            (lx + 62, horizon_y - 30), (lx + 118, horizon_y + 4)]
-    draw.polygon(rock, fill=(16, 30, 40, 255))
-    draw.line(rock, fill=(90, 130, 130, 255), width=2, joint="curve")
-    # a few pale rock highlights
-    draw.line([(lx - 88, horizon_y - 34), (lx - 40, horizon_y - 52)],
-              fill=(120, 165, 160, 255), width=3)
-
-    # ---- crystal lighthouse: tapered tower + glowing lamp room ----
-    tower_base = horizon_y - 44
-    tower_top = horizon_y - 300
-    tower = [(lx - 34, tower_base), (lx - 20, tower_top),
-             (lx + 20, tower_top), (lx + 34, tower_base)]
-    # tower glow halo (soft, behind the tower)
-    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(glow)
-    gd.ellipse([lx - 150, tower_top - 130, lx + 150, tower_top + 130],
-               fill=(190, 240, 225, 70))
-    glow = glow.filter(ImageFilter.GaussianBlur(38))
-    img = Image.alpha_composite(img, glow)
-    draw = ImageDraw.Draw(img)
-    draw.polygon(tower, fill=(214, 232, 228, 255))
-    draw.polygon(tower, outline=(120, 160, 155, 255))
-    # crystal facets: vertical light seams
-    for dx, wd in ((-12, 5), (0, 7), (12, 5)):
-        draw.line([(lx + dx, tower_top + 8), (lx + dx + (4 if dx < 0 else -4
-                  if dx > 0 else 0), tower_base - 4)],
-                  fill=(255, 255, 255, 220), width=wd)
-    # gallery + lamp room
-    draw.rectangle([lx - 30, tower_top - 16, lx + 30, tower_top + 2],
-                   fill=(30, 52, 66, 255))
-    draw.rectangle([lx - 18, tower_top - 52, lx + 18, tower_top - 16],
-                   fill=(255, 226, 150, 255))
-    draw.rectangle([lx - 18, tower_top - 52, lx + 18, tower_top - 16],
-                   outline=(90, 70, 30, 255), width=2)
-    # dome
-    draw.pieslice([lx - 22, tower_top - 76, lx + 22, tower_top - 40],
-                  180, 360, fill=(30, 52, 66, 255))
-    draw.line([(lx, tower_top - 76), (lx, tower_top - 88)],
-              fill=(30, 52, 66, 255), width=3)
-    draw.ellipse([lx - 3, tower_top - 92, lx + 3, tower_top - 86],
-                 fill=(255, 226, 150, 255))
-
-    # ---- light beams sweeping over the water ----
-    beam = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    bd = ImageDraw.Draw(beam)
-    bd.polygon([(lx, tower_top - 34), (30, horizon_y - 150),
-                (30, horizon_y - 60)], fill=(255, 240, 190, 42))
-    bd.polygon([(lx, tower_top - 34), (W - 30, horizon_y - 150),
-                (W - 30, horizon_y - 60)], fill=(255, 240, 190, 42))
-    beam = beam.filter(ImageFilter.GaussianBlur(6))
-    img = Image.alpha_composite(img, beam)
-    draw = ImageDraw.Draw(img)
-
-    # ---- distant headland silhouette (left) for depth ----
-    draw.polygon([(0, horizon_y), (0, horizon_y - 58), (70, horizon_y - 96),
-                  (150, horizon_y - 52), (210, horizon_y - 70),
-                  (250, horizon_y), (0, horizon_y)],
-                 fill=(10, 26, 40, 255))
-    # tiny harbour lights on the headland
-    for hx, hy in ((58, horizon_y - 78), (96, horizon_y - 62),
-                   (140, horizon_y - 58), (176, horizon_y - 60)):
-        draw.ellipse([hx - 2, hy - 2, hx + 2, hy + 2],
-                     fill=(255, 214, 130, 255))
-
-    # ---- title: LUMINARA, large letterspaced warm-cream caps ----
-    # Auto-fit: shrink until the letterspaced title fits with margins.
-    font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "DejaVuSans-Bold.ttf")
-    probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
-    title_size, spacing = 92, 30
-    title_font = None
-    while title_size >= 40:
-        try:
-            cand = ImageFont.truetype(font_path, title_size)
-        except Exception:
-            cand = ImageFont.load_default()
-            break
-        total_w = (sum(probe.textlength(ch, font=cand) for ch in "LUMINARA")
-                   + spacing * 7)
-        if total_w <= W - 72:
-            title_font = cand
-            break
-        title_size -= 4
-        spacing = max(14, spacing - 2)
-    if title_font is None:
-        title_font = ImageFont.load_default()
-    title_y = 64
-    # soft shadow for legibility against the aurora
-    shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    shd = ImageDraw.Draw(shadow)
-    draw_title(shd, title_font, "LUMINARA", W // 2 + 3, title_y + 4, spacing)
-    shadow = shadow.filter(ImageFilter.GaussianBlur(3))
-    # recolor shadow dark
-    dark = Image.new("RGBA", (W, H), (4, 20, 30, 0))
-    mask = shadow.split()[3]
-    dark.putalpha(mask.point(lambda v: min(200, v)))
-    img = Image.alpha_composite(img, dark)
-    draw = ImageDraw.Draw(img)
-    draw_title(draw, title_font, "LUMINARA", W // 2, title_y, spacing)
-    # thin rule under the title, echoing the horizon
-    draw.line([(W // 2 - 130, title_y + 128), (W // 2 + 130, title_y + 128)],
-              fill=(250, 238, 210, 255), width=3)
-
-    img.convert("RGB").save(os.path.join(out_dir, "entry.png"),
-                            optimize=True)
+    t0 = time.time()
+    data = encode_png()
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    with open(OUT, "wb") as f:
+        f.write(data)
+    sha = hashlib.sha256(data).hexdigest()
+    print(f"wrote {OUT}: {len(data)} bytes sha256={sha} in {time.time() - t0:.1f}s")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
